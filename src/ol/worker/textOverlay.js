@@ -26,6 +26,9 @@ import {
 const worker = self;
 
 let textRenderAnimationFrameKey = 0;
+let textRenderInProgress = false;
+const pendingRenderRequests = [];
+let pendingRenderFrameState = null;
 
 const canvas = new OffscreenCanvas(1, 1);
 const context = canvas.getContext('2d');
@@ -69,6 +72,110 @@ function getRenderTransform(
   return composeTransform(tmpTransform, dx1, dy1, sx, sy, -rotation, dx2, dy2);
 }
 
+function scheduleTextRender() {
+  if (
+    textRenderAnimationFrameKey ||
+    textRenderInProgress ||
+    !pendingRenderRequests.length
+  ) {
+    return;
+  }
+
+  textRenderAnimationFrameKey = requestAnimationFrame(() => {
+    textRenderAnimationFrameKey = 0;
+    textRenderInProgress = true;
+
+    const frameStateSerialized = pendingRenderFrameState;
+    const pendingIds = pendingRenderRequests.splice(0);
+    pendingRenderFrameState = null;
+
+    if (!pendingIds.length || !frameStateSerialized) {
+      textRenderInProgress = false;
+      scheduleTextRender();
+      return;
+    }
+
+    const frameState = deserializeFrameState(frameStateSerialized);
+    const viewState = frameState.viewState;
+
+    // Snapshot the current render list so new entries can be queued for the next frame.
+    const renderBatchKeys = Array.from(renderBatchList.values());
+    renderBatchList.clear();
+
+    // either resize or clear
+    if (
+      frameState.size[0] !== canvas.width ||
+      frameState.size[1] !== canvas.height
+    ) {
+      canvas.width = frameState.size[0];
+      canvas.height = frameState.size[1];
+    } else {
+      context.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    for (const renderBatchKey of renderBatchKeys) {
+      if (!renderBatches.has(renderBatchKey)) {
+        console.warn('Unknown render batch key ', renderBatchKey); // TODO: this should not happen, maybe throw here?
+        continue;
+      }
+      const renderBatch = renderBatches.get(renderBatchKey);
+      if (!renderBatch) {
+        // no instructions there
+        continue;
+      }
+      const transform = getRenderTransform(
+        viewState.center,
+        viewState.resolution,
+        0,
+        frameState.pixelRatio,
+        canvas.width,
+        canvas.height,
+        0,
+      );
+      multiplyTransform(transform, renderBatch.inverseTransform);
+
+      renderBatch.executor.execute(
+        context,
+        frameState.size,
+        transform,
+        frameState.viewState.rotation,
+        false,
+      );
+    }
+
+    const sendResponse = (imageData, id) => {
+      /** @type {import('../render/webgl/constants.js').TextOverlayWorkerMessage} */
+      const message = {
+        type: TextOverlayWorkerMessageType.RENDER,
+        imageData,
+        frameState: frameStateSerialized,
+        id,
+      };
+      worker.postMessage(message, [imageData]);
+    };
+
+    const finish = () => {
+      textRenderInProgress = false;
+      scheduleTextRender();
+    };
+
+    if (pendingIds.length === 1) {
+      sendResponse(canvas.transferToImageBitmap(), pendingIds[0]);
+      finish();
+      return;
+    }
+
+    Promise.all(pendingIds.map(() => createImageBitmap(canvas))).then(
+      (bitmaps) => {
+        for (let i = 0; i < pendingIds.length; i++) {
+          sendResponse(bitmaps[i], pendingIds[i]);
+        }
+        finish();
+      },
+    );
+  });
+}
+
 worker.onmessage = (event) => {
   const received = event.data;
   switch (received.type) {
@@ -79,71 +186,9 @@ worker.onmessage = (event) => {
     }
 
     case TextOverlayWorkerMessageType.RENDER: {
-      const frameState = deserializeFrameState(received.frameState);
-      const viewState = frameState.viewState;
-      if (textRenderAnimationFrameKey) {
-        // cancel the ongoing frame, render the new one
-        cancelAnimationFrame(textRenderAnimationFrameKey);
-      }
-      textRenderAnimationFrameKey = requestAnimationFrame(() => {
-        textRenderAnimationFrameKey = 0;
-
-        // either resize or clear
-        if (
-          frameState.size[0] !== canvas.width ||
-          frameState.size[1] !== canvas.height
-        ) {
-          canvas.width = frameState.size[0];
-          canvas.height = frameState.size[1];
-        } else {
-          context.clearRect(0, 0, canvas.width, canvas.height);
-        }
-
-        for (const renderBatchKey of renderBatchList.values()) {
-          if (!renderBatches.has(renderBatchKey)) {
-            console.warn('Unknown render batch key ', renderBatchKey); // TODO: this should not happen, maybe throw here?
-            continue;
-          }
-          const renderBatch = renderBatches.get(renderBatchKey);
-          if (!renderBatch) {
-            // no instructions there
-            continue;
-          }
-          const transform = getRenderTransform(
-            viewState.center,
-            viewState.resolution,
-            0,
-            frameState.pixelRatio,
-            canvas.width,
-            canvas.height,
-            0,
-          );
-          multiplyTransform(transform, renderBatch.inverseTransform);
-
-          renderBatch.executor.execute(
-            context,
-            frameState.size,
-            transform,
-            frameState.viewState.rotation,
-            false,
-          );
-        }
-
-        const imageData = canvas.transferToImageBitmap();
-
-        /** @type {import('../render/webgl/constants.js').TextOverlayWorkerMessage} */
-        const message = {
-          type: TextOverlayWorkerMessageType.RENDER,
-          imageData,
-          frameState: received.frameState,
-          id: received.id,
-        };
-        worker.postMessage(message, [imageData]);
-
-        // clear render list until next frame
-        renderBatchList.clear();
-      });
-
+      pendingRenderRequests.push(received.id);
+      pendingRenderFrameState = received.frameState;
+      scheduleTextRender();
       break;
     }
 

@@ -177,6 +177,30 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
 
     /**
      * @private
+     * @type {number}
+     */
+    this.bufferGeneration_ = 0;
+
+    /**
+     * @private
+     * @type {number}
+     */
+    this.bufferGenerationInFlight_ = 0;
+
+    /**
+     * @private
+     * @type {boolean}
+     */
+    this.rebuildQueued_ = false;
+
+    /**
+     * @private
+     * @type {Array<string>}
+     */
+    this.pendingTextInstructions_ = [];
+
+    /**
+     * @private
      */
     this.batch_ = new MixedGeometryBatch();
 
@@ -370,7 +394,9 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     this.helper.prepareDraw(frameState);
     this.renderWorlds(frameState, false, startWorld, endWorld, worldWidth);
 
-    this.styleRenderer_.finalizeTextRender(frameState);
+    this.styleRenderer_
+      .finalizeTextRender(frameState)
+      .then(() => this.flushPendingTextInstructions_());
 
     this.helper.finalizeDraw(
       frameState,
@@ -409,13 +435,24 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       !frameState.viewHints[ViewHint.ANIMATING] &&
       !frameState.viewHints[ViewHint.INTERACTING];
     const extentChanged = !equals(this.previousExtent_, frameState.extent);
-    const sourceChanged = this.sourceRevision_ < vectorSource.getRevision();
+    const sourceRevision = vectorSource.getRevision();
+    const sourceChanged = this.sourceRevision_ < sourceRevision;
+    const needsRebuild =
+      viewNotMoving && (extentChanged || sourceChanged || this.rebuildQueued_);
 
-    if (sourceChanged) {
-      this.sourceRevision_ = vectorSource.getRevision();
-    }
+    if (needsRebuild) {
+      if (this.bufferGenerationInFlight_) {
+        if (!this.rebuildQueued_) {
+          // Invalidate the in-flight generation so outdated buffers are dropped.
+          this.bufferGeneration_++;
+          this.rebuildQueued_ = true;
+        }
+        return true;
+      }
 
-    if (viewNotMoving && (extentChanged || sourceChanged)) {
+      this.rebuildQueued_ = false;
+      this.sourceRevision_ = sourceRevision;
+
       const projection = viewState.projection;
       const resolution = viewState.resolution;
 
@@ -436,6 +473,9 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
 
       this.ready = false;
 
+      const generation = ++this.bufferGeneration_;
+      this.bufferGenerationInFlight_ = generation;
+
       const transform = this.helper.makeProjectionTransform(
         frameState,
         createTransform(),
@@ -444,12 +484,32 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       this.styleRenderer_
         .generateBuffers(this.batch_, transform)
         .then((buffers) => {
+          if (generation !== this.bufferGeneration_) {
+            if (buffers) {
+              this.disposeBuffers(buffers);
+            }
+            if (this.bufferGenerationInFlight_ === generation) {
+              this.bufferGenerationInFlight_ = 0;
+            }
+            if (this.rebuildQueued_) {
+              this.getLayer().changed();
+            }
+            return;
+          }
+
+          this.bufferGenerationInFlight_ = 0;
+
           if (this.buffers_) {
             this.disposeBuffers(this.buffers_);
           }
           this.buffers_ = buffers;
           this.ready = true;
           this.getLayer().changed();
+
+          if (this.rebuildQueued_) {
+            this.rebuildQueued_ = false;
+            this.getLayer().changed();
+          }
         });
 
       this.previousExtent_ = frameState.extent.slice();
@@ -499,6 +559,32 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
         this.helper.applyHitDetectionUniform(forHitDetection);
       });
     } while (++world < endWorld);
+  }
+
+  /**
+   * Queue text instructions for disposal after the current text render completes.
+   * @param {string|null|undefined} key Text instructions key.
+   * @private
+   */
+  queueTextInstructionsDispose_(key) {
+    if (!key) {
+      return;
+    }
+    this.pendingTextInstructions_.push(key);
+  }
+
+  /**
+   * Flush queued text instruction disposals.
+   * @private
+   */
+  flushPendingTextInstructions_() {
+    if (!this.pendingTextInstructions_.length || !this.styleRenderer_) {
+      return;
+    }
+    for (const key of this.pendingTextInstructions_) {
+      this.styleRenderer_.disposeTextInstructions(key);
+    }
+    this.pendingTextInstructions_.length = 0;
   }
 
   /**
@@ -565,7 +651,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     if (buffers.polygonBuffers) {
       disposeBuffersOfType(buffers.polygonBuffers);
     }
-    this.styleRenderer_.disposeTextInstructions(buffers.textInstructionsKey);
+    this.queueTextInstructionsDispose_(buffers.textInstructionsKey);
   }
 
   /**
@@ -576,6 +662,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     if (this.buffers_) {
       this.disposeBuffers(this.buffers_);
     }
+    this.flushPendingTextInstructions_();
     if (this.sourceListenKeys_) {
       this.sourceListenKeys_.forEach(function (key) {
         unlistenByKey(key);
