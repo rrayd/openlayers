@@ -28,6 +28,8 @@ import {serializeFrameState} from './serialize.js';
 import {parseLiteralStyle} from './style.js';
 
 const tmpColor = [];
+const DEBUG_TEXT_RENDER = false;
+const DEBUG_TEXT_RENDER_LOG_EVERY = 60;
 
 /** @type {Worker|undefined} */
 let WEBGL_WORKER;
@@ -167,6 +169,12 @@ class VectorStyleRenderer extends Disposable {
      */
     this.styleShaders = convertStyleToShaders(styles, variables);
     this.styles = styles;
+
+    /**
+     * @type {boolean}
+     * @private
+     */
+    this.hasText_ = hasTextStyle(styles);
 
     /**
      * @type {AttributeDefinitions}
@@ -328,12 +336,51 @@ class VectorStyleRenderer extends Disposable {
       return renderPass;
     });
 
-    this.hasFill_ =
-      this.renderPasses_.some((pass) => pass.fillRenderPass) || true; // TODO: check for text
-    this.hasStroke_ =
-      this.renderPasses_.some((pass) => pass.strokeRenderPass) || true; // TODO: check for text
-    this.hasSymbol_ =
-      this.renderPasses_.some((pass) => pass.symbolRenderPass) || true; // TODO: check for text
+    this.hasFill_ = this.renderPasses_.some((pass) => pass.fillRenderPass);
+    this.hasStroke_ = this.renderPasses_.some((pass) => pass.strokeRenderPass);
+    this.hasSymbol_ = this.renderPasses_.some((pass) => pass.symbolRenderPass);
+
+    /**
+     * Total amount of numerical values used by all custom attributes.
+     * This is used in worker buffer generation and stays constant for the lifetime of the renderer.
+     * @type {number}
+     * @private
+     */
+    this.customAttributesSize_ = getCustomAttributesSize(
+      this.customAttributes_,
+    );
+
+    /**
+     * Custom attributes sizes map, used by the text overlay worker.
+     * This stays constant for the lifetime of the renderer.
+     * @type {Record<string, number>}
+     * @private
+     */
+    this.customAttributesSizes_ = {};
+    for (const key in this.customAttributes_) {
+      this.customAttributesSizes_[key] = this.customAttributes_[key].size || 1;
+    }
+
+    /**
+     * Render instructions arrays reused across buffer generations to reduce allocations.
+     * Ownership of the underlying ArrayBuffers is transferred to the WebGL worker and
+     * returned back with the response.
+     * @type {Float32Array}
+     * @private
+     */
+    this.polygonRenderInstructions_ = new Float32Array(0);
+
+    /**
+     * @type {Float32Array}
+     * @private
+     */
+    this.lineStringRenderInstructions_ = new Float32Array(0);
+
+    /**
+     * @type {Float32Array}
+     * @private
+     */
+    this.pointRenderInstructions_ = new Float32Array(0);
 
     /**
      * @type {HTMLCanvasElement}
@@ -376,6 +423,12 @@ class VectorStyleRenderer extends Disposable {
      * @private
      */
     this.latestTextRenderRequestId_ = 0;
+
+    /**
+     * @type {number}
+     * @private
+     */
+    this.debugTextRenderCount_ = 0;
 
     // this will initialize render passes with the given helper
     this.setHelper(helper);
@@ -438,6 +491,30 @@ class VectorStyleRenderer extends Disposable {
   }
 
   /**
+   * Generate (or refresh) text instructions without rebuilding WebGL buffers.
+   * Intended for throttled text updates during point animations.
+   * @param {import('./MixedGeometryBatch.js').default} geometryBatch Geometry batch
+   * @param {import("../../transform.js").Transform} transform Transform to apply to coordinates
+   * @return {Promise<string|null>} Resolves to a key corresponding to the text draw instructions; null if no text to render
+   */
+  async generateTextInstructionsOnly(geometryBatch, transform) {
+    if (!this.hasText_ || geometryBatch.isEmpty()) {
+      return null;
+    }
+    const labelsArray = new LabelsArray();
+    const renderInstructions = this.generateRenderInstructions_(
+      geometryBatch,
+      labelsArray,
+      transform,
+    );
+    return this.generateTextInstructions_(
+      renderInstructions,
+      labelsArray,
+      transform,
+    );
+  }
+
+  /**
    * @param {import('./MixedGeometryBatch.js').default} geometryBatch Geometry batch
    * @param {LabelsArray} labelsArray Labels array
    * @param {import("../../transform.js").Transform} transform Transform to apply to coordinates
@@ -445,33 +522,53 @@ class VectorStyleRenderer extends Disposable {
    * @private
    */
   generateRenderInstructions_(geometryBatch, labelsArray, transform) {
-    const polygonInstructions = this.hasFill_
+    const needsPolygonInstructions =
+      (this.hasFill_ || this.hasText_) &&
+      geometryBatch.polygonBatch.geometriesCount > 0;
+    const needsLineStringInstructions =
+      (this.hasStroke_ || this.hasText_) &&
+      geometryBatch.lineStringBatch.geometriesCount > 0;
+    const needsPointInstructions =
+      (this.hasSymbol_ || this.hasText_) &&
+      geometryBatch.pointBatch.geometriesCount > 0;
+
+    const polygonInstructions = needsPolygonInstructions
       ? generatePolygonRenderInstructions(
           geometryBatch.polygonBatch,
-          new Float32Array(0),
+          this.polygonRenderInstructions_,
           labelsArray,
           this.customAttributes_,
           transform,
         )
       : null;
-    const lineStringInstructions = this.hasStroke_
+    const lineStringInstructions = needsLineStringInstructions
       ? generateLineStringRenderInstructions(
           geometryBatch.lineStringBatch,
-          new Float32Array(0),
+          this.lineStringRenderInstructions_,
           labelsArray,
           this.customAttributes_,
           transform,
         )
       : null;
-    const pointInstructions = this.hasSymbol_
+    const pointInstructions = needsPointInstructions
       ? generatePointRenderInstructions(
           geometryBatch.pointBatch,
-          new Float32Array(0),
+          this.pointRenderInstructions_,
           labelsArray,
           this.customAttributes_,
           transform,
         )
       : null;
+
+    if (polygonInstructions) {
+      this.polygonRenderInstructions_ = polygonInstructions;
+    }
+    if (lineStringInstructions) {
+      this.lineStringRenderInstructions_ = lineStringInstructions;
+    }
+    if (pointInstructions) {
+      this.pointRenderInstructions_ = pointInstructions;
+    }
 
     return {
       polygonInstructions,
@@ -514,7 +611,7 @@ class VectorStyleRenderer extends Disposable {
       type: messageType,
       renderInstructions: renderInstructions.buffer,
       renderInstructionsTransform: transform,
-      customAttributesSize: getCustomAttributesSize(this.customAttributes_),
+      customAttributesSize: this.customAttributesSize_,
     };
     const WEBGL_WORKER = getWebGLWorker();
     WEBGL_WORKER.postMessage(message, [renderInstructions.buffer]);
@@ -540,6 +637,24 @@ class VectorStyleRenderer extends Disposable {
         // the helper has disposed in the meantime; the promise will not be resolved
         if (!this.helper_.getGL()) {
           return;
+        }
+
+        // Reuse the render instructions buffer returned by the worker to avoid allocations.
+        const returnedRenderInstructions = new Float32Array(
+          received.renderInstructions,
+        );
+        switch (geometryType) {
+          case 'Polygon':
+            this.polygonRenderInstructions_ = returnedRenderInstructions;
+            break;
+          case 'LineString':
+            this.lineStringRenderInstructions_ = returnedRenderInstructions;
+            break;
+          case 'Point':
+            this.pointRenderInstructions_ = returnedRenderInstructions;
+            break;
+          default:
+          // pass
         }
 
         // copy & flush received buffers to GPU
@@ -578,6 +693,15 @@ class VectorStyleRenderer extends Disposable {
    * @private
    */
   generateTextInstructions_(renderInstructions, labelsArray, transform) {
+    if (
+      !this.hasText_ ||
+      (!renderInstructions.polygonInstructions &&
+        !renderInstructions.lineStringInstructions &&
+        !renderInstructions.pointInstructions)
+    ) {
+      return null;
+    }
+
     const transferables = [labelsArray.getArray().buffer];
     let polygonRenderInstructions = null;
     let lineStringRenderInstructions = null;
@@ -600,13 +724,7 @@ class VectorStyleRenderer extends Disposable {
       ).buffer;
       transferables.push(pointRenderInstructions);
     }
-    const customAttributesSizes = Object.keys(this.customAttributes_).reduce(
-      (prev, curr) => ({
-        ...prev,
-        [curr]: this.customAttributes_[curr].size || 1,
-      }),
-      {},
-    );
+    const customAttributesSizes = this.customAttributesSizes_;
     const messageId = workerMessageCounter++;
     const textOverlayWorker = this.textOverlayWorker_;
 
@@ -662,6 +780,7 @@ class VectorStyleRenderer extends Disposable {
   render(buffers, frameState, preRenderCallback) {
     for (const renderPass of this.renderPasses_) {
       renderPass.fillRenderPass &&
+        buffers.polygonBuffers &&
         this.renderInternal_(
           buffers.polygonBuffers[0],
           buffers.polygonBuffers[1],
@@ -671,6 +790,7 @@ class VectorStyleRenderer extends Disposable {
           preRenderCallback,
         );
       renderPass.strokeRenderPass &&
+        buffers.lineStringBuffers &&
         this.renderInternal_(
           buffers.lineStringBuffers[0],
           buffers.lineStringBuffers[1],
@@ -680,6 +800,7 @@ class VectorStyleRenderer extends Disposable {
           preRenderCallback,
         );
       renderPass.symbolRenderPass &&
+        buffers.pointBuffers &&
         this.renderInternal_(
           buffers.pointBuffers[0],
           buffers.pointBuffers[1],
@@ -762,6 +883,9 @@ class VectorStyleRenderer extends Disposable {
    * @return {Promise<void>} A promise resolving after the post rendering step is over
    */
   finalizeTextRender(frameState) {
+    if (!this.hasText_) {
+      return Promise.resolve();
+    }
     const serializedFrameState = serializeFrameState(frameState);
 
     if (this.textRenderInFlight_) {
@@ -790,6 +914,7 @@ class VectorStyleRenderer extends Disposable {
     const textOverlayWorker = this.textOverlayWorker_;
     this.latestTextRenderRequestId_ = messageId;
     this.textRenderInFlight_ = true;
+    const renderStarted = DEBUG_TEXT_RENDER ? performance.now() : 0;
     textOverlayWorker.postMessage({
       type: TextOverlayWorkerMessageType.RENDER,
       frameState: serializedFrameState,
@@ -829,6 +954,17 @@ class VectorStyleRenderer extends Disposable {
         }
 
         resolve();
+        if (DEBUG_TEXT_RENDER) {
+          this.debugTextRenderCount_++;
+          if (this.debugTextRenderCount_ % DEBUG_TEXT_RENDER_LOG_EVERY === 0) {
+            const renderTime = performance.now() - renderStarted;
+            // eslint-disable-next-line no-console
+            console.debug('textOverlay main render', {
+              ms: Math.round(renderTime),
+              queued: !!this.queuedTextRenderFrameState_,
+            });
+          }
+        }
 
         if (this.queuedTextRenderFrameState_) {
           const nextFrameState = this.queuedTextRenderFrameState_;
@@ -904,6 +1040,32 @@ class VectorStyleRenderer extends Disposable {
   }
 
   /**
+   * @return {boolean} Whether the style contains text.
+   */
+  hasText() {
+    return this.hasText_;
+  }
+
+  /**
+   * Clear the text overlay canvas and reset its frame state.
+   */
+  clearTextOverlay() {
+    if (!this.textOverlayCanvas_) {
+      return;
+    }
+    const context = this.textOverlayCanvas_.getContext('2d');
+    if (context) {
+      context.clearRect(
+        0,
+        0,
+        this.textOverlayCanvas_.width,
+        this.textOverlayCanvas_.height,
+      );
+    }
+    this.textOverlayRenderFrameState_ = null;
+  }
+
+  /**
    * Dispose of text instructions in worker.
    * @param {string} key Key corresponding to the instructions set to dispose
    */
@@ -925,6 +1087,46 @@ class VectorStyleRenderer extends Disposable {
 }
 
 export default VectorStyleRenderer;
+
+/**
+ * @param {FlatStyleLike|StyleShaders|Array<StyleShaders>} styles Styles to inspect.
+ * @return {boolean} Whether any text style properties are present.
+ */
+function hasTextStyle(styles) {
+  if (!styles) {
+    return false;
+  }
+  if (Array.isArray(styles)) {
+    for (let i = 0; i < styles.length; i++) {
+      const entry = styles[i];
+      if (!entry) {
+        continue;
+      }
+      if (typeof entry === 'object' && 'style' in entry) {
+        if (hasTextStyle(entry.style)) {
+          return true;
+        }
+      } else if (typeof entry === 'object' && 'sourceRule' in entry) {
+        const rule = entry.sourceRule;
+        if (rule && 'style' in rule && hasTextStyle(rule.style)) {
+          return true;
+        }
+      } else if (hasTextStyle(entry)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (typeof styles !== 'object') {
+    return false;
+  }
+  for (const key in styles) {
+    if (key.startsWith('text-')) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Breaks down a vector style into an array of prebuilt shader builders with attributes and uniforms

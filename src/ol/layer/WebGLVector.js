@@ -42,6 +42,9 @@ import Layer from './Layer.js';
  * FIXME: not supported yet
  * @property {boolean} [disableHitDetection=false] Setting this to true will provide a slight performance boost, but will
  * prevent all hit detection on the layer.
+ * @property {number|'auto'} [textRenderThrottleMs='auto'] Minimum interval in ms between text overlay updates
+ * (text render + instructions rebuild) when animating points. Use `'auto'` to adapt to device performance.
+ * Use `0` to disable throttling (update on every change).
  * @property {Object<string, *>} [properties] Arbitrary observable properties. Can be accessed with `#get()` and `#set()`.
  */
 
@@ -84,6 +87,12 @@ class WebGLVectorLayer extends Layer {
      * @private
      */
     this.hitDetectionDisabled_ = !!options.disableHitDetection;
+
+    /**
+     * @type {number|'auto'|undefined|null}
+     * @private
+     */
+    this.textRenderThrottleMs_ = options.textRenderThrottleMs;
   }
 
   /**
@@ -94,6 +103,7 @@ class WebGLVectorLayer extends Layer {
       style: this.style_,
       variables: this.styleVariables_,
       disableHitDetection: this.hitDetectionDisabled_,
+      textRenderThrottleMs: this.textRenderThrottleMs_,
     });
   }
 

@@ -237,6 +237,7 @@ export function convertPolygonRenderInstructionsToCanvasTextBuilder(
   );
   const instructionsPerVertex = 2; // x, y
   const sharedData = {};
+  const propEntries = Array.from(properties.entries());
 
   let instructionsIndex = 0;
   while (instructionsIndex < renderInstructions.length) {
@@ -266,7 +267,6 @@ export function convertPolygonRenderInstructionsToCanvasTextBuilder(
       ),
     );
     const polygon = new Polygon(flatCoords, 'XY', ends);
-    const propEntries = Array.from(properties.entries());
     for (let i = 0; i < propEntries.length; i++) {
       const [propName, propType] = propEntries[i];
       textFeatureProps[propName] = readCustomAttributeValue(
@@ -319,6 +319,7 @@ export function convertLineStringRenderInstructionsToCanvasTextBuilder(
   );
   const instructionsPerVertex = 3; // x, y
   const sharedData = {};
+  const propEntries = Array.from(properties.entries());
 
   let currentInstructionsIndex = 0;
 
@@ -342,7 +343,6 @@ export function convertLineStringRenderInstructionsToCanvasTextBuilder(
     );
 
     const lineString = new LineString(flatCoords, 'XYM'); // render instructions always provide XYM coordinates
-    const propEntries = Array.from(properties.entries());
     for (let i = 0; i < propEntries.length; i++) {
       const [propName, propType] = propEntries[i];
       textFeatureProps[propName] = readCustomAttributeValue(
@@ -395,12 +395,13 @@ export function convertPointRenderInstructionsToCanvasTextBuilder(
   );
   const instructionsPerVertex = 2; // x, y
   const sharedData = {};
+  const propEntries = Array.from(properties.entries());
 
   let currentInstructionsIndex = 0;
   while (currentInstructionsIndex < renderInstructions.length) {
     const flatCoords = [
-      renderInstructions.at(currentInstructionsIndex),
-      renderInstructions.at(currentInstructionsIndex + 1),
+      renderInstructions[currentInstructionsIndex],
+      renderInstructions[currentInstructionsIndex + 1],
     ];
     currentInstructionsIndex += instructionsPerVertex;
     const customAttributesValues = new Float32Array(
@@ -410,7 +411,6 @@ export function convertPointRenderInstructionsToCanvasTextBuilder(
     );
 
     const point = new Point(flatCoords, 'XY');
-    const propEntries = Array.from(properties.entries());
     for (let i = 0; i < propEntries.length; i++) {
       const [propName, propType] = propEntries[i];
       textFeatureProps[propName] = readCustomAttributeValue(

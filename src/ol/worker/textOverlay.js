@@ -27,8 +27,12 @@ const worker = self;
 
 let textRenderAnimationFrameKey = 0;
 let textRenderInProgress = false;
-const pendingRenderRequests = [];
-let pendingRenderFrameState = null;
+const pendingRenders = [];
+let instructionsSetCounter = 0;
+
+const DEBUG_TEXT_OVERLAY = false;
+const DEBUG_TEXT_OVERLAY_LOG_EVERY = 60;
+let debugTextOverlayRenderCount = 0;
 
 const canvas = new OffscreenCanvas(1, 1);
 const context = canvas.getContext('2d');
@@ -76,7 +80,7 @@ function scheduleTextRender() {
   if (
     textRenderAnimationFrameKey ||
     textRenderInProgress ||
-    !pendingRenderRequests.length
+    !pendingRenders.length
   ) {
     return;
   }
@@ -85,22 +89,18 @@ function scheduleTextRender() {
     textRenderAnimationFrameKey = 0;
     textRenderInProgress = true;
 
-    const frameStateSerialized = pendingRenderFrameState;
-    const pendingIds = pendingRenderRequests.splice(0);
-    pendingRenderFrameState = null;
-
-    if (!pendingIds.length || !frameStateSerialized) {
+    const renderJob = pendingRenders.shift();
+    if (!renderJob) {
       textRenderInProgress = false;
       scheduleTextRender();
       return;
     }
 
+    const {id, frameState: frameStateSerialized, renderBatchKeys} = renderJob;
     const frameState = deserializeFrameState(frameStateSerialized);
     const viewState = frameState.viewState;
 
-    // Snapshot the current render list so new entries can be queued for the next frame.
-    const renderBatchKeys = Array.from(renderBatchList.values());
-    renderBatchList.clear();
+    const renderStart = DEBUG_TEXT_OVERLAY ? performance.now() : 0;
 
     // either resize or clear
     if (
@@ -115,6 +115,7 @@ function scheduleTextRender() {
 
     for (const renderBatchKey of renderBatchKeys) {
       if (!renderBatches.has(renderBatchKey)) {
+        // eslint-disable-next-line no-console
         console.warn('Unknown render batch key ', renderBatchKey); // TODO: this should not happen, maybe throw here?
         continue;
       }
@@ -154,26 +155,39 @@ function scheduleTextRender() {
       worker.postMessage(message, [imageData]);
     };
 
-    const finish = () => {
-      textRenderInProgress = false;
-      scheduleTextRender();
-    };
-
-    if (pendingIds.length === 1) {
-      sendResponse(canvas.transferToImageBitmap(), pendingIds[0]);
-      finish();
-      return;
+    sendResponse(canvas.transferToImageBitmap(), id);
+    textRenderInProgress = false;
+    if (DEBUG_TEXT_OVERLAY) {
+      debugTextOverlayRenderCount++;
+      if (debugTextOverlayRenderCount % DEBUG_TEXT_OVERLAY_LOG_EVERY === 0) {
+        const renderTime = performance.now() - renderStart;
+        // eslint-disable-next-line no-console
+        console.debug('textOverlay render', {
+          ms: Math.round(renderTime),
+          batches: renderBatchKeys.length,
+          pending: pendingRenders.length,
+        });
+      }
     }
-
-    Promise.all(pendingIds.map(() => createImageBitmap(canvas))).then(
-      (bitmaps) => {
-        for (let i = 0; i < pendingIds.length; i++) {
-          sendResponse(bitmaps[i], pendingIds[i]);
-        }
-        finish();
-      },
-    );
+    scheduleTextRender();
   });
+}
+
+function enqueueTextRender(id, frameStateSerialized) {
+  // Snapshot the current render list so new entries can be queued for the next frame.
+  const renderBatchKeys = Array.from(renderBatchList.values());
+  renderBatchList.clear();
+
+  pendingRenders.push({
+    id,
+    frameState: frameStateSerialized,
+    renderBatchKeys,
+  });
+  if (DEBUG_TEXT_OVERLAY && pendingRenders.length > 1) {
+    // eslint-disable-next-line no-console
+    console.debug('textOverlay render queue', pendingRenders.length);
+  }
+  scheduleTextRender();
 }
 
 worker.onmessage = (event) => {
@@ -186,14 +200,15 @@ worker.onmessage = (event) => {
     }
 
     case TextOverlayWorkerMessageType.RENDER: {
-      pendingRenderRequests.push(received.id);
-      pendingRenderFrameState = received.frameState;
-      scheduleTextRender();
+      enqueueTextRender(received.id, received.frameState);
       break;
     }
 
     case TextOverlayWorkerMessageType.BUILD_INSTRUCTIONS: {
-      console.time('BUILD_INSTRUCTIONS');
+      if (DEBUG_TEXT_OVERLAY) {
+        // eslint-disable-next-line no-console
+        console.time('BUILD_INSTRUCTIONS');
+      }
       const {
         polygonRenderInstructions,
         lineStringRenderInstructions,
@@ -206,7 +221,7 @@ worker.onmessage = (event) => {
       } = received;
       const resolution = 1;
       const pixelRatio = 1;
-      const instructionsSetKey = Date.now().toString();
+      const instructionsSetKey = String(++instructionsSetCounter);
       const labelsArray = new Uint8Array(received.labelsArray);
       const builder = new TextBuilder(
         1,
@@ -219,7 +234,10 @@ worker.onmessage = (event) => {
       stripNonTextStyleProperties(style);
       const styleFn = flatStyleLikeToStyleFunction(style, parsingContext);
 
-      console.timeLog('BUILD_INSTRUCTIONS', '/ converted style to styleFn');
+      if (DEBUG_TEXT_OVERLAY) {
+        // eslint-disable-next-line no-console
+        console.timeLog('BUILD_INSTRUCTIONS', '/ converted style to styleFn');
+      }
 
       convertPolygonRenderInstructionsToCanvasTextBuilder(
         new Float32Array(polygonRenderInstructions),
@@ -229,7 +247,10 @@ worker.onmessage = (event) => {
         builder,
         styleFn,
       );
-      console.timeLog('BUILD_INSTRUCTIONS', '/ parsed polygon instructions');
+      if (DEBUG_TEXT_OVERLAY) {
+        // eslint-disable-next-line no-console
+        console.timeLog('BUILD_INSTRUCTIONS', '/ parsed polygon instructions');
+      }
       convertLineStringRenderInstructionsToCanvasTextBuilder(
         new Float32Array(lineStringRenderInstructions),
         renderInstructionsTransform,
@@ -239,7 +260,13 @@ worker.onmessage = (event) => {
         builder,
         styleFn,
       );
-      console.timeLog('BUILD_INSTRUCTIONS', '/ parsed lineString instructions');
+      if (DEBUG_TEXT_OVERLAY) {
+        // eslint-disable-next-line no-console
+        console.timeLog(
+          'BUILD_INSTRUCTIONS',
+          '/ parsed lineString instructions',
+        );
+      }
       convertPointRenderInstructionsToCanvasTextBuilder(
         new Float32Array(pointRenderInstructions),
         renderInstructionsTransform,
@@ -249,7 +276,10 @@ worker.onmessage = (event) => {
         builder,
         styleFn,
       );
-      console.timeLog('BUILD_INSTRUCTIONS', '/ parsed point instructions');
+      if (DEBUG_TEXT_OVERLAY) {
+        // eslint-disable-next-line no-console
+        console.timeLog('BUILD_INSTRUCTIONS', '/ parsed point instructions');
+      }
 
       const canvasInstructions = builder.finish();
 
@@ -278,7 +308,10 @@ worker.onmessage = (event) => {
       };
       worker.postMessage(message);
 
-      console.timeEnd('BUILD_INSTRUCTIONS');
+      if (DEBUG_TEXT_OVERLAY) {
+        // eslint-disable-next-line no-console
+        console.timeEnd('BUILD_INSTRUCTIONS');
+      }
       break;
     }
 
@@ -287,6 +320,7 @@ worker.onmessage = (event) => {
       if (renderBatches.has(instructionsSetKey)) {
         renderBatches.delete(instructionsSetKey);
       }
+      renderBatchList.delete(instructionsSetKey);
       break;
     }
 
