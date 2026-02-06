@@ -45,10 +45,11 @@ export const Uniforms = {
 };
 
 const DEFAULT_TEXT_RENDER_THROTTLE_MS = 120;
-const MIN_TEXT_RENDER_THROTTLE_MS = 50;
-const MAX_TEXT_RENDER_THROTTLE_MS = 1000;
+const MIN_TEXT_RENDER_THROTTLE_MS = 16;
+const MAX_TEXT_RENDER_THROTTLE_MS = 2000;
+const TARGET_DUTY_CYCLE = 0.25;
+const CRITICAL_FPS_THRESHOLD = 45;
 const TEXT_RENDER_THROTTLE_SMOOTHING = 0.2;
-const TEXT_RENDER_THROTTLE_MULTIPLIER = 1.5;
 
 function nowMs() {
   return typeof performance !== 'undefined' && performance.now
@@ -79,16 +80,16 @@ function nowMs() {
 /**
  * @classdesc
  * Experimental WebGL vector renderer. Supports polygons, lines and points:
- *  Polygons are broken down into triangles
- *  Lines are rendered as strips of quads
- *  Points are rendered as quads
+ * Polygons are broken down into triangles
+ * Lines are rendered as strips of quads
+ * Points are rendered as quads
  *
  * You need to provide vertex and fragment shaders as well as custom attributes for each type of geometry. All shaders
  * can access the uniforms in the {@link module:ol/webgl/Helper~DefaultUniform} enum.
  * The vertex shaders can access the following attributes depending on the geometry type:
- *  For polygons: {@link module:ol/render/webgl/PolygonBatchRenderer~Attributes}
- *  For line strings: {@link module:ol/render/webgl/LineStringBatchRenderer~Attributes}
- *  For points: {@link module:ol/render/webgl/PointBatchRenderer~Attributes}
+ * For polygons: {@link module:ol/render/webgl/PolygonBatchRenderer~Attributes}
+ * For line strings: {@link module:ol/render/webgl/LineStringBatchRenderer~Attributes}
+ * For points: {@link module:ol/render/webgl/PointBatchRenderer~Attributes}
  *
  * Please note that the fragment shaders output should have premultiplied alpha, otherwise visual anomalies may occur.
  *
@@ -116,6 +117,13 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
         ...(options.postProcesses ?? []),
       ],
     });
+
+    /**
+     * last time of rederFrame call for FPS detection
+     * @type {number}
+     * @private
+     */
+    this.lastFrameTime_ = nowMs();
 
     /**
      * @type {boolean}
@@ -742,9 +750,10 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   /**
    * Throttled refresh of text instructions for animated points.
    * @param {import("../../Map.js").FrameState} frameState Frame state.
+   * @param {number} currentFps currentFps
    * @private
    */
-  maybeRebuildTextInstructions_(frameState) {
+  maybeRebuildTextInstructions_(frameState, currentFps) {
     if (
       !this.textRenderThrottleMs_ ||
       !this.textRebuildNeeded_ ||
@@ -802,7 +811,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
                 (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
               duration * TEXT_RENDER_THROTTLE_SMOOTHING
             : duration;
-          this.updateTextRenderThrottle_();
+          this.updateTextRenderThrottle_(currentFps);
         }
 
         if (!textInstructionsKey) {
@@ -837,27 +846,69 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   /**
    * @private
    */
-  updateTextRenderThrottle_() {
-    const avg = Math.max(
-      this.textRebuildDurationAvgMs_,
-      this.textRenderDurationAvgMs_,
-    );
-    if (!avg) {
+  /**
+   * Адаптивный расчет троттлинга на основе стоимости операции и текущего FPS.
+   * @param {number} currentFps Мгновенный FPS карты (полезно для обнаружения просадок).
+   * @private
+   */
+  updateTextRenderThrottle_(currentFps) {
+    // 1. Оценка "стоимости" задачи (берем максимум из генерации инструкций или отрисовки)
+    // Добавляем небольшой оверхед (10%), так как есть накладные расходы на postMessage и переключения контекста
+    const taskCostMs =
+      Math.max(this.textRebuildDurationAvgMs_, this.textRenderDurationAvgMs_) *
+      1.1;
+
+    // Если метрик пока нет, используем безопасный дефолт
+    if (!taskCostMs) {
+      this.textRenderThrottleMs_ = DEFAULT_TEXT_RENDER_THROTTLE_MS;
       return;
     }
-    const nextThrottle = Math.ceil(avg * TEXT_RENDER_THROTTLE_MULTIPLIER);
-    this.textRenderThrottleMs_ = Math.min(
-      MAX_TEXT_RENDER_THROTTLE_MS,
-      Math.max(MIN_TEXT_RENDER_THROTTLE_MS, nextThrottle),
+
+    // 2. Определяем доступный бюджет (Duty Cycle)
+    // Базовый бюджет - TARGET_DUTY_CYCLE.
+    // Если FPS просел (карта лагает), мы уменьшаем бюджет пропорционально просадке.
+    let effectiveDutyCycle = TARGET_DUTY_CYCLE;
+
+    if (currentFps < CRITICAL_FPS_THRESHOLD) {
+      // Пример: если FPS 30 при пороге 45, мы снижаем бюджет в (30/45) раз.
+      // При FPS 30 бюджет станет 0.25 * 0.66 = 0.16 (16%)
+      // При FPS 15 бюджет станет 0.25 * 0.33 = 0.08 (8%)
+      const performanceFactor = Math.max(
+        0.1,
+        currentFps / CRITICAL_FPS_THRESHOLD,
+      );
+      effectiveDutyCycle *= performanceFactor;
+    }
+
+    // 3. Расчет идеального интервала
+    // Формула: TotalTime = Cost / DutyCycle
+    // Throttle (Wait) = TotalTime - Cost
+    // Пример: Cost 10ms, Duty 0.2 (20%). Total = 50ms. Wait = 40ms.
+    const idealInterval = taskCostMs / effectiveDutyCycle - taskCostMs;
+
+    // 4. Сглаживание и ограничения
+    // Используем простое линейное ограничение [MIN, MAX]
+    const clampedInterval = Math.max(
+      MIN_TEXT_RENDER_THROTTLE_MS,
+      Math.min(MAX_TEXT_RENDER_THROTTLE_MS, idealInterval),
     );
+
+    // Применяем сглаживание к самому значению троттлинга, чтобы не "скакало" слишком резко
+    this.textRenderThrottleMs_ =
+      this.textRenderThrottleMs_ * (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
+      clampedInterval * TEXT_RENDER_THROTTLE_SMOOTHING;
+
+    // (Опционально для дебага)
+    // console.log(`Cost: ${taskCostMs.toFixed(1)}ms, FPS: ${currentFps.toFixed(0)}, Cycle: ${effectiveDutyCycle.toFixed(2)}, Throttle: ${this.textRenderThrottleMs_.toFixed(0)}ms`);
   }
 
   /**
    * Throttled render of the text overlay.
    * @param {import("../../Map.js").FrameState} frameState Frame state.
+   * @param {number} currentFps current fps
    * @private
    */
-  maybeFinalizeTextRender_(frameState) {
+  maybeFinalizeTextRender_(frameState, currentFps) {
     if (!this.styleRenderer_) {
       return;
     }
@@ -882,9 +933,15 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     }
     this.lastTextOverlayRenderTime_ = now;
 
+    // FIX: Flush pending instructions BEFORE starting the render.
+    // This ensures that the worker receives the DISPOSE message for old keys
+    // before the RENDER message, preventing it from drawing both the old and new text
+    // in the same frame (which caused ghosting and opacity accumulation).
+    this.flushPendingTextInstructions_();
+
     const renderStart = nowMs();
     this.styleRenderer_.finalizeTextRender(frameState).then(() => {
-      this.flushPendingTextInstructions_();
+      // Removed flushPendingTextInstructions_() from here
       if (this.textRenderThrottleAuto_) {
         const duration = nowMs() - renderStart;
         this.textRenderDurationAvgMs_ = this.textRenderDurationAvgMs_
@@ -892,7 +949,7 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
               (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
             duration * TEXT_RENDER_THROTTLE_SMOOTHING
           : duration;
-        this.updateTextRenderThrottle_();
+        this.updateTextRenderThrottle_(currentFps);
       }
     });
   }
@@ -932,6 +989,14 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
    * @override
    */
   renderFrame(frameState) {
+    const now = nowMs();
+    const frameDuration = now - this.lastFrameTime_;
+    this.lastFrameTime_ = now;
+
+    // Protection against zero-case and anomalies (minimum 1 frame)
+    const currentFps =
+      frameDuration > 0 ? 1000 / Math.max(frameDuration, 16.6) : 60;
+
     const gl = this.helper.getGL();
     this.preRender(gl, frameState);
 
@@ -943,13 +1008,13 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     // Apply any pending fast position updates before drawing.
     this.flushPointUpdates_(gl);
     // Throttled text refresh during animations (if enabled).
-    this.maybeRebuildTextInstructions_(frameState);
+    this.maybeRebuildTextInstructions_(frameState, currentFps);
 
     // draw the normal canvas
     this.helper.prepareDraw(frameState);
     this.renderWorlds(frameState, false, startWorld, endWorld, worldWidth);
 
-    this.maybeFinalizeTextRender_(frameState);
+    this.maybeFinalizeTextRender_(frameState, currentFps);
 
     this.helper.finalizeDraw(
       frameState,

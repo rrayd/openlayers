@@ -940,9 +940,20 @@ class VectorStyleRenderer extends Disposable {
 
           // the rendered image data is copied to the canvas and then given back to the worker
           const imageData = received.imageData;
-          this.textOverlayCanvas_.width = imageData.width;
-          this.textOverlayCanvas_.height = imageData.height;
-          this.textOverlayCanvas_.getContext('2d').drawImage(imageData, 0, 0);
+          const context = this.textOverlayCanvas_.getContext('2d');
+          if (context.globalCompositeOperation !== 'copy') {
+            context.globalCompositeOperation = 'copy';
+          }
+
+          if (
+            this.textOverlayCanvas_.width !== imageData.width ||
+            this.textOverlayCanvas_.height !== imageData.height
+          ) {
+            this.textOverlayCanvas_.width = imageData.width;
+            this.textOverlayCanvas_.height = imageData.height;
+          }
+          context.drawImage(imageData, 0, 0);
+
           this.textOverlayCanvas_.style.transform = received.transform;
           textOverlayWorker.postMessage(
             {
