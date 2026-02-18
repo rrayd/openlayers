@@ -28,6 +28,7 @@ const worker = self;
 let textRenderAnimationFrameKey = 0;
 let textRenderInProgress = false;
 const pendingRenders = [];
+let lastNonEmptyRenderBatchKeys = [];
 let instructionsSetCounter = 0;
 
 const DEBUG_TEXT_OVERLAY = false;
@@ -175,14 +176,34 @@ function scheduleTextRender() {
 
 function enqueueTextRender(id, frameStateSerialized) {
   // Snapshot the current render list so new entries can be queued for the next frame.
-  const renderBatchKeys = Array.from(renderBatchList.values());
+  const snapshotBatchKeys = Array.from(renderBatchList.values());
   renderBatchList.clear();
+  let renderBatchKeys = snapshotBatchKeys.filter((key) =>
+    renderBatches.has(key),
+  );
 
-  pendingRenders.push({
+  // If this frame raced and did not receive ADD_TO_RENDER_LIST yet, reuse the last
+  // non-empty set to avoid transient empty overlays (visible flicker).
+  if (!renderBatchKeys.length && snapshotBatchKeys.length === 0) {
+    renderBatchKeys = lastNonEmptyRenderBatchKeys.filter((key) =>
+      renderBatches.has(key),
+    );
+  }
+  if (renderBatchKeys.length) {
+    lastNonEmptyRenderBatchKeys = renderBatchKeys.slice();
+  }
+
+  const renderJob = {
     id,
     frameState: frameStateSerialized,
     renderBatchKeys,
-  });
+  };
+  if (pendingRenders.length) {
+    // Keep only the latest request to avoid rendering stale intermediate frames.
+    pendingRenders[pendingRenders.length - 1] = renderJob;
+  } else {
+    pendingRenders.push(renderJob);
+  }
   if (DEBUG_TEXT_OVERLAY && pendingRenders.length > 1) {
     // eslint-disable-next-line no-console
     console.debug('textOverlay render queue', pendingRenders.length);
@@ -216,19 +237,19 @@ worker.onmessage = (event) => {
         style,
         customAttributesSizes,
         renderInstructionsTransform,
+        buildClipExtent,
         id,
         // TODO: view projection
       } = received;
       const resolution = 1;
       const pixelRatio = 1;
+      const maxExtent =
+        buildClipExtent && buildClipExtent.length === 4
+          ? buildClipExtent
+          : [-Infinity, -Infinity, Infinity, Infinity];
       const instructionsSetKey = String(++instructionsSetCounter);
       const labelsArray = new Uint8Array(received.labelsArray);
-      const builder = new TextBuilder(
-        1,
-        [-Infinity, -Infinity, Infinity, Infinity],
-        resolution,
-        pixelRatio,
-      );
+      const builder = new TextBuilder(1, maxExtent, resolution, pixelRatio);
 
       const parsingContext = newParsingContext();
       stripNonTextStyleProperties(style);
@@ -275,6 +296,7 @@ worker.onmessage = (event) => {
         customAttributesSizes,
         builder,
         styleFn,
+        buildClipExtent,
       );
       if (DEBUG_TEXT_OVERLAY) {
         // eslint-disable-next-line no-console
@@ -321,6 +343,11 @@ worker.onmessage = (event) => {
         renderBatches.delete(instructionsSetKey);
       }
       renderBatchList.delete(instructionsSetKey);
+      if (lastNonEmptyRenderBatchKeys.length) {
+        lastNonEmptyRenderBatchKeys = lastNonEmptyRenderBatchKeys.filter(
+          (key) => key !== instructionsSetKey,
+        );
+      }
       break;
     }
 

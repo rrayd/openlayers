@@ -50,4 +50,5 @@ export const TextOverlayWorkerMessageType = {
  * @property {import("../../Map.js").FrameState} [frameState] Frame state of the rendered image
  * @property {string} [instructionsSetKey] Key corresponding to a generated text instructions set
  * @property {import('../../style/flat.js').FlatStyleLike} [style] Flat style
+ * @property {import("../../extent.js").Extent} [buildClipExtent] Clip-space extent used for early text culling.
  */

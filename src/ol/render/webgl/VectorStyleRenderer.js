@@ -30,6 +30,7 @@ import {parseLiteralStyle} from './style.js';
 const tmpColor = [];
 const DEBUG_TEXT_RENDER = false;
 const DEBUG_TEXT_RENDER_LOG_EVERY = 60;
+const TEXT_BUILD_CULL_PADDING_CLIP = 0.2;
 
 /** @type {Worker|undefined} */
 let WEBGL_WORKER;
@@ -727,6 +728,12 @@ class VectorStyleRenderer extends Disposable {
     const customAttributesSizes = this.customAttributesSizes_;
     const messageId = workerMessageCounter++;
     const textOverlayWorker = this.textOverlayWorker_;
+    const buildClipExtent = [
+      -1 - TEXT_BUILD_CULL_PADDING_CLIP,
+      -1 - TEXT_BUILD_CULL_PADDING_CLIP,
+      1 + TEXT_BUILD_CULL_PADDING_CLIP,
+      1 + TEXT_BUILD_CULL_PADDING_CLIP,
+    ];
 
     let style = this.styles;
     if (Array.isArray(this.styles)) {
@@ -746,6 +753,7 @@ class VectorStyleRenderer extends Disposable {
         style,
         customAttributesSizes,
         renderInstructionsTransform: transform,
+        buildClipExtent,
         id: messageId,
       },
       transferables,
@@ -764,6 +772,7 @@ class VectorStyleRenderer extends Disposable {
         }
 
         // we're getting a key from the worker: these will be used later on to ask for render or disposal
+        textOverlayWorker.removeEventListener('message', handleMessage);
         resolve(received.instructionsSetKey);
       };
 

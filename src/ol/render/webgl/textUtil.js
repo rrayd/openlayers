@@ -377,6 +377,7 @@ export function convertLineStringRenderInstructionsToCanvasTextBuilder(
  * @param {Record<string, number>} customAttributesSizes Custom attributes sizes
  * @param {import('../canvas/TextBuilder.js').default} textBuilder Text builder
  * @param {import('../../style/Style.js').StyleFunction} styleFunction Text style
+ * @param {import('../../extent.js').Extent} [buildClipExtent] Extent in clip space used for early culling.
  * @private
  */
 export function convertPointRenderInstructionsToCanvasTextBuilder(
@@ -387,6 +388,7 @@ export function convertPointRenderInstructionsToCanvasTextBuilder(
   customAttributesSizes,
   textBuilder,
   styleFunction,
+  buildClipExtent,
 ) {
   const customAttributesKeys = Object.keys(customAttributesSizes);
   const totalCustomAttributesSize = customAttributesKeys.reduce(
@@ -396,14 +398,25 @@ export function convertPointRenderInstructionsToCanvasTextBuilder(
   const instructionsPerVertex = 2; // x, y
   const sharedData = {};
   const propEntries = Array.from(properties.entries());
+  const hasBuildClipExtent = !!buildClipExtent && buildClipExtent.length === 4;
+  const minClipX = hasBuildClipExtent ? buildClipExtent[0] : 0;
+  const minClipY = hasBuildClipExtent ? buildClipExtent[1] : 0;
+  const maxClipX = hasBuildClipExtent ? buildClipExtent[2] : 0;
+  const maxClipY = hasBuildClipExtent ? buildClipExtent[3] : 0;
 
   let currentInstructionsIndex = 0;
   while (currentInstructionsIndex < renderInstructions.length) {
-    const flatCoords = [
-      renderInstructions[currentInstructionsIndex],
-      renderInstructions[currentInstructionsIndex + 1],
-    ];
+    const x = renderInstructions[currentInstructionsIndex];
+    const y = renderInstructions[currentInstructionsIndex + 1];
     currentInstructionsIndex += instructionsPerVertex;
+    if (
+      hasBuildClipExtent &&
+      (x < minClipX || x > maxClipX || y < minClipY || y > maxClipY)
+    ) {
+      currentInstructionsIndex += totalCustomAttributesSize;
+      continue;
+    }
+    const flatCoords = [x, y];
     const customAttributesValues = new Float32Array(
       renderInstructions.buffer,
       currentInstructionsIndex * Float32Array.BYTES_PER_ELEMENT,

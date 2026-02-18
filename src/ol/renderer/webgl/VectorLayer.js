@@ -44,12 +44,18 @@ export const Uniforms = {
   TEXT_OVERLAY_MATRIX: 'u_textOverlayMatrix',
 };
 
-const DEFAULT_TEXT_RENDER_THROTTLE_MS = 120;
+const DEFAULT_TEXT_REBUILD_THROTTLE_MS = 120;
+const DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS = 48;
 const MIN_TEXT_RENDER_THROTTLE_MS = 16;
-const MAX_TEXT_RENDER_THROTTLE_MS = 2000;
-const TARGET_DUTY_CYCLE = 0.25;
+const MAX_TEXT_REBUILD_THROTTLE_MS = 2000;
+const MAX_TEXT_OVERLAY_RENDER_THROTTLE_MS = 400;
+const MAX_TEXT_OVERLAY_RENDER_THROTTLE_MOVING_MS = 80;
+const TARGET_REBUILD_DUTY_CYCLE = 0.22;
+const TARGET_OVERLAY_RENDER_DUTY_CYCLE = 0.35;
 const CRITICAL_FPS_THRESHOLD = 45;
 const TEXT_RENDER_THROTTLE_SMOOTHING = 0.2;
+const TEXT_RENDER_FPS_SMOOTHING = 0.2;
+const TEXT_REBUILD_VISIBILITY_PADDING_CLIP = 0.2;
 
 function nowMs() {
   return typeof performance !== 'undefined' && performance.now
@@ -209,12 +215,19 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     this.pointInstanceStride_ = 0;
 
     /**
-     * Minimum interval in ms between text overlay updates (render + instructions rebuild)
-     * during point animations. A value of 0 keeps the previous behavior (update on every change).
+     * Minimum interval in ms between text instruction rebuilds during point animations.
+     * A value of 0 keeps the previous behavior (rebuild on every change).
      * @type {number}
      * @private
      */
     this.textRenderThrottleMs_ = 0;
+
+    /**
+     * Minimum interval in ms between text overlay render passes.
+     * @type {number}
+     * @private
+     */
+    this.textOverlayRenderThrottleMs_ = 0;
 
     /**
      * Whether text throttling is automatically derived from device performance.
@@ -236,6 +249,13 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
      * @private
      */
     this.textRenderDurationAvgMs_ = 0;
+
+    /**
+     * Exponential moving average of frame FPS used by adaptive throttling.
+     * @type {number}
+     * @private
+     */
+    this.currentFpsAvg_ = 60;
 
     /**
      * Whether a text instructions refresh is needed due to point animation updates.
@@ -285,6 +305,14 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
      * @private
      */
     this.textRebuildTimerId_ = 0;
+
+    /**
+     * Last text instructions key successfully rendered to the text overlay.
+     * Used to force an immediate overlay refresh when instructions were replaced.
+     * @type {string|null}
+     * @private
+     */
+    this.lastRenderedTextInstructionsKey_ = null;
 
     /**
      * @type {import('../../style/flat.js').StyleVariables}
@@ -424,10 +452,13 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     const throttle = options.textRenderThrottleMs;
     if (throttle === undefined || throttle === null || throttle === 'auto') {
       this.textRenderThrottleAuto_ = true;
-      this.textRenderThrottleMs_ = DEFAULT_TEXT_RENDER_THROTTLE_MS;
+      this.textRenderThrottleMs_ = DEFAULT_TEXT_REBUILD_THROTTLE_MS;
+      this.textOverlayRenderThrottleMs_ =
+        DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS;
     } else {
       this.textRenderThrottleAuto_ = false;
       this.textRenderThrottleMs_ = Math.max(0, throttle);
+      this.textOverlayRenderThrottleMs_ = Math.max(0, throttle);
     }
     this.textRebuildNeeded_ = false;
     this.textRebuildQueued_ = false;
@@ -436,6 +467,8 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
     this.lastTextOverlayRenderTime_ = -Infinity;
     this.textRebuildDurationAvgMs_ = 0;
     this.textRenderDurationAvgMs_ = 0;
+    this.currentFpsAvg_ = 60;
+    this.lastRenderedTextInstructionsKey_ = null;
     if (this.textRebuildTimerId_) {
       clearTimeout(this.textRebuildTimerId_);
       this.textRebuildTimerId_ = 0;
@@ -545,7 +578,14 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
           this.buffers_?.textInstructionsKey &&
           this.textRenderThrottleMs_ > 0
         ) {
-          this.textRebuildNeeded_ = true;
+          if (
+            !this.textRebuildNeeded_ &&
+            this.isPointPotentiallyVisibleForText_(
+              pointGeometry.getFlatCoordinates(),
+            )
+          ) {
+            this.textRebuildNeeded_ = true;
+          }
         }
         return;
       }
@@ -748,6 +788,29 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   }
 
   /**
+   * Check whether a point can contribute to text rendering for the current view.
+   * Coordinates are tested in clip space against the viewport expanded by a small
+   * padding to avoid pop-in at screen edges.
+   * @param {Array<number>} flatCoordinates Point flat coordinates.
+   * @return {boolean} Whether the point is potentially visible for text rendering.
+   * @private
+   */
+  isPointPotentiallyVisibleForText_(flatCoordinates) {
+    if (!flatCoordinates || flatCoordinates.length < 2) {
+      return false;
+    }
+    const t = this.renderTransform_;
+    const clipX = t[0] * flatCoordinates[0] + t[2] * flatCoordinates[1] + t[4];
+    const clipY = t[1] * flatCoordinates[0] + t[3] * flatCoordinates[1] + t[5];
+    if (!Number.isFinite(clipX) || !Number.isFinite(clipY)) {
+      return true;
+    }
+    const min = -1 - TEXT_REBUILD_VISIBILITY_PADDING_CLIP;
+    const max = 1 + TEXT_REBUILD_VISIBILITY_PADDING_CLIP;
+    return clipX >= min && clipX <= max && clipY >= min && clipY <= max;
+  }
+
+  /**
    * Throttled refresh of text instructions for animated points.
    * @param {import("../../Map.js").FrameState} frameState Frame state.
    * @param {number} currentFps currentFps
@@ -811,7 +874,10 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
                 (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
               duration * TEXT_RENDER_THROTTLE_SMOOTHING
             : duration;
-          this.updateTextRenderThrottle_(currentFps);
+          const viewMoving =
+            frameState.viewHints[ViewHint.ANIMATING] ||
+            frameState.viewHints[ViewHint.INTERACTING];
+          this.updateTextRenderThrottle_(currentFps, viewMoving);
         }
 
         if (!textInstructionsKey) {
@@ -844,62 +910,63 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
   }
 
   /**
+   * Adaptive throttling for text rebuild and overlay render.
+   * Rebuilds can be slower than overlay blits to avoid visible flicker.
+   * @param {number} currentFps Current map FPS.
+   * @param {boolean} viewMoving Whether view is animating/interacting.
    * @private
    */
-  /**
-   * Адаптивный расчет троттлинга на основе стоимости операции и текущего FPS.
-   * @param {number} currentFps Мгновенный FPS карты (полезно для обнаружения просадок).
-   * @private
-   */
-  updateTextRenderThrottle_(currentFps) {
-    // 1. Оценка "стоимости" задачи (берем максимум из генерации инструкций или отрисовки)
-    // Добавляем небольшой оверхед (10%), так как есть накладные расходы на postMessage и переключения контекста
-    const taskCostMs =
-      Math.max(this.textRebuildDurationAvgMs_, this.textRenderDurationAvgMs_) *
-      1.1;
+  updateTextRenderThrottle_(currentFps, viewMoving) {
+    this.currentFpsAvg_ = this.currentFpsAvg_
+      ? this.currentFpsAvg_ * (1 - TEXT_RENDER_FPS_SMOOTHING) +
+        currentFps * TEXT_RENDER_FPS_SMOOTHING
+      : currentFps;
+    const fps = this.currentFpsAvg_ || currentFps;
+    const performanceFactor =
+      fps < CRITICAL_FPS_THRESHOLD
+        ? Math.max(0.2, fps / CRITICAL_FPS_THRESHOLD)
+        : 1;
+    const rebuildCostMs = this.textRebuildDurationAvgMs_ * 1.1;
+    const overlayRenderCostMs = this.textRenderDurationAvgMs_ * 1.05;
 
-    // Если метрик пока нет, используем безопасный дефолт
-    if (!taskCostMs) {
-      this.textRenderThrottleMs_ = DEFAULT_TEXT_RENDER_THROTTLE_MS;
-      return;
-    }
-
-    // 2. Определяем доступный бюджет (Duty Cycle)
-    // Базовый бюджет - TARGET_DUTY_CYCLE.
-    // Если FPS просел (карта лагает), мы уменьшаем бюджет пропорционально просадке.
-    let effectiveDutyCycle = TARGET_DUTY_CYCLE;
-
-    if (currentFps < CRITICAL_FPS_THRESHOLD) {
-      // Пример: если FPS 30 при пороге 45, мы снижаем бюджет в (30/45) раз.
-      // При FPS 30 бюджет станет 0.25 * 0.66 = 0.16 (16%)
-      // При FPS 15 бюджет станет 0.25 * 0.33 = 0.08 (8%)
-      const performanceFactor = Math.max(
-        0.1,
-        currentFps / CRITICAL_FPS_THRESHOLD,
+    if (rebuildCostMs > 0) {
+      const rebuildDutyCycle = TARGET_REBUILD_DUTY_CYCLE * performanceFactor;
+      const rebuildInterval = rebuildCostMs / rebuildDutyCycle - rebuildCostMs;
+      const clampedRebuildInterval = Math.max(
+        MIN_TEXT_RENDER_THROTTLE_MS,
+        Math.min(MAX_TEXT_REBUILD_THROTTLE_MS, rebuildInterval),
       );
-      effectiveDutyCycle *= performanceFactor;
+      this.textRenderThrottleMs_ =
+        this.textRenderThrottleMs_ * (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
+        clampedRebuildInterval * TEXT_RENDER_THROTTLE_SMOOTHING;
+    } else {
+      this.textRenderThrottleMs_ = DEFAULT_TEXT_REBUILD_THROTTLE_MS;
     }
 
-    // 3. Расчет идеального интервала
-    // Формула: TotalTime = Cost / DutyCycle
-    // Throttle (Wait) = TotalTime - Cost
-    // Пример: Cost 10ms, Duty 0.2 (20%). Total = 50ms. Wait = 40ms.
-    const idealInterval = taskCostMs / effectiveDutyCycle - taskCostMs;
-
-    // 4. Сглаживание и ограничения
-    // Используем простое линейное ограничение [MIN, MAX]
-    const clampedInterval = Math.max(
-      MIN_TEXT_RENDER_THROTTLE_MS,
-      Math.min(MAX_TEXT_RENDER_THROTTLE_MS, idealInterval),
-    );
-
-    // Применяем сглаживание к самому значению троттлинга, чтобы не "скакало" слишком резко
-    this.textRenderThrottleMs_ =
-      this.textRenderThrottleMs_ * (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
-      clampedInterval * TEXT_RENDER_THROTTLE_SMOOTHING;
-
-    // (Опционально для дебага)
-    // console.log(`Cost: ${taskCostMs.toFixed(1)}ms, FPS: ${currentFps.toFixed(0)}, Cycle: ${effectiveDutyCycle.toFixed(2)}, Throttle: ${this.textRenderThrottleMs_.toFixed(0)}ms`);
+    if (overlayRenderCostMs > 0) {
+      const overlayDutyCycle =
+        TARGET_OVERLAY_RENDER_DUTY_CYCLE * performanceFactor;
+      const overlayInterval =
+        overlayRenderCostMs / overlayDutyCycle - overlayRenderCostMs;
+      const maxOverlayThrottle = viewMoving
+        ? MAX_TEXT_OVERLAY_RENDER_THROTTLE_MOVING_MS
+        : MAX_TEXT_OVERLAY_RENDER_THROTTLE_MS;
+      const clampedOverlayInterval = Math.max(
+        MIN_TEXT_RENDER_THROTTLE_MS,
+        Math.min(maxOverlayThrottle, overlayInterval),
+      );
+      this.textOverlayRenderThrottleMs_ =
+        this.textOverlayRenderThrottleMs_ *
+          (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
+        clampedOverlayInterval * TEXT_RENDER_THROTTLE_SMOOTHING;
+    } else {
+      this.textOverlayRenderThrottleMs_ = viewMoving
+        ? Math.min(
+            DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS,
+            MAX_TEXT_OVERLAY_RENDER_THROTTLE_MOVING_MS,
+          )
+        : DEFAULT_TEXT_OVERLAY_RENDER_THROTTLE_MS;
+    }
   }
 
   /**
@@ -915,6 +982,8 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
 
     if (this.batch_.isEmpty() || !this.styleRenderer_.hasText()) {
       this.styleRenderer_.clearTextOverlay();
+      this.lastRenderedTextInstructionsKey_ = null;
+      this.flushPendingTextInstructions_();
       return;
     }
 
@@ -924,24 +993,26 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
       return;
     }
 
+    const currentTextInstructionsKey = this.buffers_.textInstructionsKey;
+    const keyChanged =
+      currentTextInstructionsKey !== this.lastRenderedTextInstructionsKey_;
     const now = frameState.time;
     if (
-      this.textRenderThrottleMs_ > 0 &&
-      now - this.lastTextOverlayRenderTime_ < this.textRenderThrottleMs_
+      this.textOverlayRenderThrottleMs_ > 0 &&
+      !keyChanged &&
+      now - this.lastTextOverlayRenderTime_ < this.textOverlayRenderThrottleMs_
     ) {
       return;
     }
     this.lastTextOverlayRenderTime_ = now;
 
-    // FIX: Flush pending instructions BEFORE starting the render.
-    // This ensures that the worker receives the DISPOSE message for old keys
-    // before the RENDER message, preventing it from drawing both the old and new text
-    // in the same frame (which caused ghosting and opacity accumulation).
-    this.flushPendingTextInstructions_();
-
     const renderStart = nowMs();
     this.styleRenderer_.finalizeTextRender(frameState).then(() => {
-      // Removed flushPendingTextInstructions_() from here
+      if (this.buffers_?.textInstructionsKey === currentTextInstructionsKey) {
+        this.lastRenderedTextInstructionsKey_ = currentTextInstructionsKey;
+        // Dispose old instruction sets only after the new key has been rendered.
+        this.flushPendingTextInstructions_();
+      }
       if (this.textRenderThrottleAuto_) {
         const duration = nowMs() - renderStart;
         this.textRenderDurationAvgMs_ = this.textRenderDurationAvgMs_
@@ -949,7 +1020,10 @@ class WebGLVectorLayerRenderer extends WebGLLayerRenderer {
               (1 - TEXT_RENDER_THROTTLE_SMOOTHING) +
             duration * TEXT_RENDER_THROTTLE_SMOOTHING
           : duration;
-        this.updateTextRenderThrottle_(currentFps);
+        const viewMoving =
+          frameState.viewHints[ViewHint.ANIMATING] ||
+          frameState.viewHints[ViewHint.INTERACTING];
+        this.updateTextRenderThrottle_(currentFps, viewMoving);
       }
     });
   }
