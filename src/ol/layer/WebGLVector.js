@@ -45,6 +45,11 @@ import Layer from './Layer.js';
  * @property {number|'auto'} [textRenderThrottleMs='auto'] Minimum interval in ms between text overlay updates
  * (text render + instructions rebuild) when animating points. Use `'auto'` to adapt to device performance.
  * Use `0` to disable throttling (update on every change).
+ * @property {boolean|'soft'|'strict'|'glyph-soft'|'glyph-strict'} [gpuStaticLabel=false] Enables radical label mode where
+ * point text is rendered as icon symbols in the main GPU pass.
+ * `true` is equivalent to `'strict'` (single initial bake string-atlas).
+ * Use `'soft'` for incremental refreshes of string-atlas labels.
+ * Use `'glyph-soft'` / `'glyph-strict'` for an experimental glyph-atlas path (memory scales with unique glyphs).
  * @property {Object<string, *>} [properties] Arbitrary observable properties. Can be accessed with `#get()` and `#set()`.
  */
 
@@ -93,6 +98,12 @@ class WebGLVectorLayer extends Layer {
      * @private
      */
     this.textRenderThrottleMs_ = options.textRenderThrottleMs;
+
+    /**
+     * @type {boolean|'soft'|'strict'|'glyph-soft'|'glyph-strict'|undefined}
+     * @private
+     */
+    this.gpuStaticLabel_ = options.gpuStaticLabel;
   }
 
   /**
@@ -104,6 +115,7 @@ class WebGLVectorLayer extends Layer {
       variables: this.styleVariables_,
       disableHitDetection: this.hitDetectionDisabled_,
       textRenderThrottleMs: this.textRenderThrottleMs_,
+      gpuStaticLabel: this.gpuStaticLabel_,
     });
   }
 

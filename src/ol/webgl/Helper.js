@@ -837,6 +837,7 @@ class WebGLHelper extends Disposable {
    */
   applyUniforms(frameState) {
     const gl = this.gl_;
+    const transparentTexturePixel = new Uint8Array([0, 0, 0, 0]);
 
     let value;
     let textureSlot = 0;
@@ -866,23 +867,61 @@ class WebGLHelper extends Disposable {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-        const imageReady =
-          !(value instanceof HTMLImageElement) ||
-          /** @type {HTMLImageElement} */ (value).complete;
-        if (
-          !(value instanceof WebGLTexture) &&
-          imageReady &&
-          uniform.prevValue !== value
-        ) {
-          uniform.prevValue = value;
+        const uploadTransparentTexture = () => {
           gl.texImage2D(
             gl.TEXTURE_2D,
             0,
             gl.RGBA,
+            1,
+            1,
+            0,
             gl.RGBA,
             gl.UNSIGNED_BYTE,
-            value,
+            transparentTexturePixel,
           );
+        };
+
+        if (!(value instanceof WebGLTexture)) {
+          // Always initialize newly created textures to a known transparent value.
+          if (uniform.prevValue === undefined) {
+            uploadTransparentTexture();
+            uniform.prevValue = null;
+          }
+
+          let canUploadImage = true;
+          if (value instanceof HTMLImageElement) {
+            canUploadImage =
+              value.complete &&
+              value.naturalWidth > 0 &&
+              value.naturalHeight > 0;
+          } else if (value instanceof HTMLCanvasElement) {
+            canUploadImage = value.width > 0 && value.height > 0;
+          } else if (value instanceof ImageData) {
+            canUploadImage = value.width > 0 && value.height > 0;
+          }
+
+          if (canUploadImage) {
+            if (uniform.prevValue !== value) {
+              try {
+                gl.texImage2D(
+                  gl.TEXTURE_2D,
+                  0,
+                  gl.RGBA,
+                  gl.RGBA,
+                  gl.UNSIGNED_BYTE,
+                  value,
+                );
+                uniform.prevValue = value;
+              } catch {
+                // Keep texture deterministic even if upload fails (e.g. invalid image dimensions).
+                uploadTransparentTexture();
+                uniform.prevValue = null;
+              }
+            }
+          } else if (uniform.prevValue !== null) {
+            uploadTransparentTexture();
+            uniform.prevValue = null;
+          }
         }
         textureSlot++;
       } else if (Array.isArray(value) && value.length === 6) {

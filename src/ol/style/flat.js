@@ -189,11 +189,13 @@
  */
 
 /**
- * Icon style properties applied to point features. `icon-src` must be provided to render
- * points with an icon.
+ * Icon style properties applied to point features. `icon-src` or `icon-image`
+ * must be provided to render points with an icon.
  *
  * @typedef {Object} FlatIcon
  * @property {string} [icon-src] Image source URI.
+ * @property {HTMLCanvasElement|HTMLImageElement|ImageData} [icon-image] Image object to use directly instead of
+ * `icon-src`. Useful for runtime-generated atlases (WebGL).
  * @property {NumberArrayExpression} [icon-anchor=[0.5, 0.5]] Anchor. Default value is the icon center.
  * @property {import("./Icon.js").IconOrigin} [icon-anchor-origin='top-left'] Origin of the anchor: `bottom-left`, `bottom-right`,
  * `top-left` or `top-right`.
@@ -223,6 +225,9 @@
  * @property {BooleanExpression} [icon-rotate-with-view=false] Whether to rotate the icon with the view. (Expressions only supported in Canvas)
  * @property {SizeExpression} [icon-size] Icon size in pixel. Can be used together with `icon-offset` to define the
  * sub-rectangle to use from the origin (sprite) icon image. (Expressions only in WebGL)
+ * @property {boolean} [icon-sdf=false] When true, interpret icon alpha channel as signed-distance field and apply edge smoothing in shader (WebGL).
+ * @property {NumberExpression} [icon-sdf-cutoff=0.5] SDF threshold value at contour edge (WebGL).
+ * @property {NumberExpression} [icon-sdf-smoothing=1.25] Additional smoothing width in screen pixels (WebGL).
  * @property {import("./Style.js").DeclutterMode} [icon-declutter-mode] Declutter mode (Canvas only)
  * @property {NumberExpression} [z-index] The zIndex of the style. (Canvas only)
  */

@@ -19,6 +19,7 @@ import {
   newCompilationContext,
   stringToGlsl,
 } from '../../expr/gpu.js';
+import {getUid} from '../../util.js';
 import {ShaderBuilder} from './ShaderBuilder.js';
 import {
   applyContextToBuilder,
@@ -142,20 +143,52 @@ function getColorFromDistanceField(
  * @return {string} The image size expression
  */
 function parseImageProperties(style, builder, uniforms, prefix, textureId) {
-  const image = new Image();
-  image.crossOrigin =
-    style[`${prefix}cross-origin`] === undefined
-      ? 'anonymous'
-      : style[`${prefix}cross-origin`];
-  assert(
-    typeof style[`${prefix}src`] === 'string',
-    `WebGL layers do not support expressions for the ${prefix}src style property`,
-  );
-  image.src = /** @type {string} */ (style[`${prefix}src`]);
+  let image;
+  if (`${prefix}image` in style) {
+    image = style[`${prefix}image`];
+    const isCanvas =
+      typeof HTMLCanvasElement !== 'undefined' &&
+      image instanceof HTMLCanvasElement;
+    const isImage =
+      typeof HTMLImageElement !== 'undefined' &&
+      image instanceof HTMLImageElement;
+    const isImageData =
+      typeof ImageData !== 'undefined' && image instanceof ImageData;
+    assert(
+      isCanvas || isImage || isImageData,
+      `Expected ${prefix}image to be an HTMLCanvasElement, HTMLImageElement, or ImageData`,
+    );
+  } else {
+    image = new Image();
+    image.crossOrigin =
+      style[`${prefix}cross-origin`] === undefined
+        ? 'anonymous'
+        : style[`${prefix}cross-origin`];
+    assert(
+      typeof style[`${prefix}src`] === 'string',
+      `WebGL layers do not support expressions for the ${prefix}src style property`,
+    );
+    image.src = /** @type {string} */ (style[`${prefix}src`]);
+  }
 
   // the size is provided asynchronously using a uniform
   uniforms[`u_texture${textureId}_size`] = () => {
-    return image.complete ? [image.width, image.height] : [0, 0];
+    if (
+      typeof HTMLImageElement !== 'undefined' &&
+      image instanceof HTMLImageElement
+    ) {
+      return image.complete ? [image.width, image.height] : [0, 0];
+    }
+    if (
+      typeof HTMLCanvasElement !== 'undefined' &&
+      image instanceof HTMLCanvasElement
+    ) {
+      return [image.width, image.height];
+    }
+    if (typeof ImageData !== 'undefined' && image instanceof ImageData) {
+      return [image.width, image.height];
+    }
+    return [0, 0];
   };
   builder.addUniform(`u_texture${textureId}_size`, 'vec2');
   const size = `u_texture${textureId}_size`;
@@ -424,7 +457,16 @@ function parseIconProperties(style, builder, uniforms, context) {
   }
 
   // IMAGE & SIZE
-  const textureId = computeHash(style['icon-src']);
+  const textureSource =
+    'icon-image' in style ? style['icon-image'] : style['icon-src'];
+  assert(
+    textureSource !== undefined,
+    'Either icon-src or icon-image must be provided for icon styles',
+  );
+  const textureId =
+    typeof textureSource === 'string'
+      ? computeHash(textureSource)
+      : String(getUid(textureSource));
   const sizeExpression = parseImageProperties(
     style,
     builder,
@@ -432,10 +474,30 @@ function parseIconProperties(style, builder, uniforms, context) {
     'icon-',
     textureId,
   );
+
+  let symbolColorExpression = `${color} * texture2D(u_texture${textureId}, v_texCoord)`;
+  if ('icon-sdf' in style && style['icon-sdf'] === true) {
+    const cutoff =
+      'icon-sdf-cutoff' in style
+        ? expressionToGlsl(context, style['icon-sdf-cutoff'], NumberType)
+        : '0.5';
+    const smoothingPx =
+      'icon-sdf-smoothing' in style
+        ? expressionToGlsl(context, style['icon-sdf-smoothing'], NumberType)
+        : '1.25';
+    builder.addFragmentShaderFunction(
+      `vec4 sampleSdfIcon(vec4 tint, sampler2D texture, vec2 texCoord, float cutoff, float smoothingPx, vec2 quadSizePx) {
+  float distanceValue = texture2D(texture, texCoord).a;
+  float smoothing = max(0.001, smoothingPx / max(quadSizePx.x, quadSizePx.y));
+  float alpha = smoothstep(cutoff - smoothing, cutoff + smoothing, distanceValue);
+  return vec4(tint.rgb, tint.a * alpha);
+}`,
+    );
+    symbolColorExpression = `sampleSdfIcon(${color}, u_texture${textureId}, v_texCoord, ${cutoff}, ${smoothingPx}, v_quadSizePx)`;
+  }
+
   builder
-    .setSymbolColorExpression(
-      `${color} * texture2D(u_texture${textureId}, v_texCoord)`,
-    )
+    .setSymbolColorExpression(symbolColorExpression)
     .setSymbolSizeExpression(sizeExpression);
 
   // override size if width/height were specified
@@ -932,7 +994,7 @@ export function parseLiteralStyle(style, variables, filter) {
   /** @type {Object<string,import("../../webgl/Helper").UniformValue>} */
   const uniforms = {};
 
-  if ('icon-src' in style) {
+  if ('icon-src' in style || 'icon-image' in style) {
     parseIconProperties(style, builder, uniforms, context);
   } else if ('shape-points' in style) {
     parseShapeProperties(style, builder, uniforms, context);
@@ -943,7 +1005,9 @@ export function parseLiteralStyle(style, variables, filter) {
   parseFillProperties(style, builder, uniforms, context);
   try {
     parseTextProperties(style, builder, uniforms, context); // this will not change the shaders but still collect the properties
-  } catch (e) {}
+  } catch {
+    // ignore unsupported text expressions when building shaders
+  }
 
   // note that the style filter may have already been applied earlier when building the rendering instructions
   // this is still needed in case a filter cannot be evaluated statically beforehand (e.g. depending on time)
